@@ -1,8 +1,9 @@
-
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 import 'admin_main.dart';
+
+const String allowedAdminUid = 'RjyDooTkieWR2J9RFIY0A2yhdnm2';
 
 class AdminLogin extends StatefulWidget {
   const AdminLogin({super.key});
@@ -32,8 +33,7 @@ class _AdminLoginState extends State<AdminLogin> {
     setState(() => _loading = true);
 
     try {
-      final credential =
-          await FirebaseAuth.instance.signInWithEmailAndPassword(
+      final credential = await FirebaseAuth.instance.signInWithEmailAndPassword(
         email: _emailController.text.trim(),
         password: _passwordController.text,
       );
@@ -44,13 +44,10 @@ class _AdminLoginState extends State<AdminLogin> {
         throw Exception('Hindi makuha ang user account.');
       }
 
-      // Kailangan ng admin custom claim para sa admin access.
-      final token = await user.getIdTokenResult(true);
-      final isAdmin = token.claims?['admin'] == true;
-
       if (!mounted) return;
 
-      if (!isAdmin) {
+      if (allowedAdminUid == 'REPLACE_WITH_FIREBASE_AUTH_UID' ||
+          user.uid != allowedAdminUid) {
         await FirebaseAuth.instance.signOut();
 
         if (!mounted) return;
@@ -58,7 +55,7 @@ class _AdminLoginState extends State<AdminLogin> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
-              'Walang admin access ang account na ito.',
+              'Hindi pa naka-configure bilang admin ang account na ito.',
             ),
           ),
         );
@@ -66,9 +63,7 @@ class _AdminLoginState extends State<AdminLogin> {
       }
 
       Navigator.of(context).pushReplacement(
-        MaterialPageRoute<void>(
-          builder: (context) => const AdminMain(),
-        ),
+        MaterialPageRoute<void>(builder: (context) => const AdminMain()),
       );
     } on FirebaseAuthException catch (e) {
       if (!mounted) return;
@@ -85,8 +80,7 @@ class _AdminLoginState extends State<AdminLogin> {
           message = 'Hindi valid ang email address.';
           break;
         case 'too-many-requests':
-          message =
-              'Masyadong maraming pagtatangka. Subukan ulit mamaya.';
+          message = 'Masyadong maraming pagtatangka. Subukan ulit mamaya.';
           break;
         case 'network-request-failed':
           message = 'Walang koneksiyon. Suriin ang internet.';
@@ -95,15 +89,13 @@ class _AdminLoginState extends State<AdminLogin> {
           message = 'Hindi makapag-login: ${e.message ?? e.code}';
       }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(message)));
     } catch (e) {
       if (!mounted) return;
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('May error: $e')),
-      );
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('May error: $e')));
     } finally {
       if (mounted) {
         setState(() => _loading = false);

@@ -1,12 +1,20 @@
 import 'dart:async';
+import 'dart:math';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
+import 'admin_login.dart';
+
 import 'dart:convert';
+
 import 'firebase_options.dart';
+
+import 'package:shared_preferences/shared_preferences.dart';
 
 // Supabase publishable key only. Never put the Xendit Secret API Key in Flutter.
 const String supabasePublishableKey =
@@ -14,11 +22,48 @@ const String supabasePublishableKey =
 const String xenditCheckoutEndpoint =
     'https://buskevifxjycrvtzxvtr.supabase.co/functions/v1/create-xendit-checkout';
 
+class OrderHistoryAccess {
+  static const _storageKey = 'dc_foodhub_order_history_key';
+
+  static Future<String> loadOrCreate() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_storageKey);
+    if (saved != null && isValid(saved)) return saved;
+
+    final bytes = List<int>.generate(32, (_) => Random.secure().nextInt(256));
+    final key = base64Url.encode(bytes).replaceAll('=', '');
+    await prefs.setString(_storageKey, key);
+    return key;
+  }
+
+  static bool isValid(String key) =>
+      RegExp(r'^[A-Za-z0-9_-]{43}$').hasMatch(key);
+
+  static Future<void> save(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_storageKey, key);
+  }
+
+  static Future<void> ensureMembership(String key) async {
+    User? user = FirebaseAuth.instance.currentUser;
+    user ??= (await FirebaseAuth.instance.signInAnonymously()).user;
+    if (user == null) throw Exception('Hindi ma-create ang customer session.');
+
+    final member = FirebaseFirestore.instance
+        .collection('historyGroups')
+        .doc(key)
+        .collection('members')
+        .doc(user.uid);
+
+    if (!(await member.get()).exists) {
+      await member.set({'joinedAt': FieldValue.serverTimestamp()});
+    }
+  }
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(
-    options: DefaultFirebaseOptions.currentPlatform,
-  );
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
 
   // Anonymous authentication means the customer does not need a login screen.
   try {
@@ -43,9 +88,7 @@ class FoodHubApp extends StatelessWidget {
       theme: ThemeData(
         useMaterial3: true,
         scaffoldBackgroundColor: const Color(0xFFFFFBF5),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFE86B35),
-        ),
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFFE86B35)),
         fontFamily: 'Roboto',
       ),
       home: const HomePage(),
@@ -208,10 +251,10 @@ class CustomerDetails {
   });
 
   Map<String, dynamic> toMap() => {
-        'name': name,
-        'phone': phone,
-        'address': address,
-      };
+    'name': name,
+    'phone': phone,
+    'address': address,
+  };
 }
 
 class HomePage extends StatefulWidget {
@@ -228,12 +271,50 @@ class _HomePageState extends State<HomePage> {
   final Map<String, int> cart = {};
   final Map<String, FoodItem> cartFoods = {};
   bool checkoutLoading = false;
+  String? historyKey;
+  bool historyAccessReady = false;
   CustomerDetails? lastDetails; // para hindi na ulit-ulitin ang pag-type
 
   final List<String> categories = [
-    'All', 'Healthy', 'Salad', 'Breakfast', 'Snack',
-    'Lunch', 'Dinner', 'Dessert', 'Drinks',
+    'All',
+    'Healthy',
+    'Salad',
+    'Breakfast',
+    'Snack',
+    'Lunch',
+    'Dinner',
+    'Dessert',
+    'Drinks',
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeHistoryAccess();
+  }
+
+  Future<void> _initializeHistoryAccess() async {
+    try {
+      await _ensureHistoryAccess();
+    } catch (error) {
+      debugPrint('Order history initialization failed: $error');
+    }
+  }
+
+  Future<void> _ensureHistoryAccess() async {
+    if (historyAccessReady && historyKey != null) {
+      await OrderHistoryAccess.ensureMembership(historyKey!);
+      return;
+    }
+
+    final key = await OrderHistoryAccess.loadOrCreate();
+    await OrderHistoryAccess.ensureMembership(key);
+    if (!mounted) return;
+    setState(() {
+      historyKey = key;
+      historyAccessReady = true;
+    });
+  }
 
   @override
   void dispose() {
@@ -279,10 +360,12 @@ class _HomePageState extends State<HomePage> {
 
   List<FoodItem> filterFoods(List<FoodItem> foods) {
     return foods.where((food) {
-      final matchesCategory = selectedCategory == 'All' ||
+      final matchesCategory =
+          selectedCategory == 'All' ||
           food.category.toLowerCase() == selectedCategory.toLowerCase();
-      final matchesSearch =
-          food.name.toLowerCase().contains(searchText.toLowerCase());
+      final matchesSearch = food.name.toLowerCase().contains(
+        searchText.toLowerCase(),
+      );
       return matchesCategory && matchesSearch;
     }).toList();
   }
@@ -295,23 +378,27 @@ class _HomePageState extends State<HomePage> {
     required double total,
     required CustomerDetails details,
   }) async {
+    await _ensureHistoryAccess();
     User? user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      user = (await FirebaseAuth.instance.signInAnonymously()).user;
-    }
+    user ??= (await FirebaseAuth.instance.signInAnonymously()).user;
     if (user == null) {
       throw Exception('Hindi ma-create ang customer session.');
     }
 
-    final orderItems = items.map((food) => {
-      'productId': food.id,
-      'name': food.name,
-      'price': food.price,
-      'quantity': cart[food.id] ?? 0,
-    }).toList();
+    final orderItems = items
+        .map(
+          (food) => {
+            'productId': food.id,
+            'name': food.name,
+            'price': food.price,
+            'quantity': cart[food.id] ?? 0,
+          },
+        )
+        .toList();
 
     final orderRef = await FirebaseFirestore.instance.collection('orders').add({
       'customerUid': user.uid,
+      'historyKey': historyKey!,
       'items': orderItems,
       'totalAmount': total,
       'customer': details.toMap(),
@@ -322,22 +409,32 @@ class _HomePageState extends State<HomePage> {
     return orderRef.id;
   }
 
-  void showOrderHistory() {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Hindi pa available ang customer session.'),
+  Future<void> showOrderHistory() async {
+    try {
+      await _ensureHistoryAccess();
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => OrderHistoryPage(
+            historyKey: historyKey!,
+            onHistoryKeyChanged: (key) {
+              if (!mounted) return;
+              setState(() {
+                historyKey = key;
+                historyAccessReady = true;
+              });
+            },
+          ),
         ),
       );
-      return;
+    } catch (error) {
+      debugPrint('Unable to open order history: $error');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Hindi maihanda ang order history: $error')),
+      );
     }
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (_) => OrderHistoryPage(customerUid: user.uid),
-      ),
-    );
   }
 
   void showPaymentStatus({
@@ -358,9 +455,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   double totalFor(List<FoodItem> items) => items.fold<double>(
-        0,
-        (sum, food) => sum + food.price * (cart[food.id] ?? 0),
-      );
+    0,
+    (sum, food) => sum + food.price * (cart[food.id] ?? 0),
+  );
 
   // Binubuksan ang Order Details page bago mag-payment.
   void openOrderReview(List<FoodItem> items) {
@@ -397,7 +494,9 @@ class _HomePageState extends State<HomePage> {
     try {
       if (supabasePublishableKey.trim().isEmpty ||
           supabasePublishableKey == 'YOUR_SUPABASE_PUBLISHABLE_KEY') {
-        throw Exception('Ilagay muna ang Supabase publishable key sa main.dart.');
+        throw Exception(
+          'Ilagay muna ang Supabase publishable key sa main.dart.',
+        );
       }
       if (!amount.isFinite || amount < 1 || amount > 100000) {
         throw Exception('Invalid checkout amount.');
@@ -411,19 +510,18 @@ class _HomePageState extends State<HomePage> {
       );
       debugPrint('Saved pending order: $orderId');
 
-      final response = await http.post(
-        Uri.parse(xenditCheckoutEndpoint),
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'apikey': supabasePublishableKey,
-          'Authorization': 'Bearer $supabasePublishableKey',
-        },
-        body: jsonEncode({
-          'amount': amount,
-          'external_id': orderId,
-        }),
-      ).timeout(const Duration(seconds: 30));
+      final response = await http
+          .post(
+            Uri.parse(xenditCheckoutEndpoint),
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+              'apikey': supabasePublishableKey,
+              'Authorization': 'Bearer $supabasePublishableKey',
+            },
+            body: jsonEncode({'amount': amount, 'external_id': orderId}),
+          )
+          .timeout(const Duration(seconds: 30));
 
       Map<String, dynamic> responseData;
       try {
@@ -498,7 +596,9 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('May hindi inaasahang error sa checkout. Subukan muli.'),
+          content: Text(
+            'May hindi inaasahang error sa checkout. Subukan muli.',
+          ),
           behavior: SnackBarBehavior.floating,
         ),
       );
@@ -538,6 +638,18 @@ class _HomePageState extends State<HomePage> {
           ],
         ),
         actions: [
+          IconButton(
+            tooltip: 'Admin',
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => const AdminLogin(),
+                ),
+              );
+            },
+            icon: const Icon(Icons.admin_panel_settings_outlined),
+          ),
           TextButton.icon(
             onPressed: showOrderHistory,
             icon: const Icon(Icons.history, size: 22),
@@ -586,11 +698,11 @@ class _HomePageState extends State<HomePage> {
 
             final List<FoodItem> foods =
                 snapshot.hasData && snapshot.data!.docs.isNotEmpty
-                    ? snapshot.data!.docs
-                        .where((doc) => doc.data()['available'] != false)
-                        .map((doc) => FoodItem.fromMap(doc.id, doc.data()))
-                        .toList()
-                    : sampleFoods;
+                ? snapshot.data!.docs
+                      .where((doc) => doc.data()['available'] != false)
+                      .map((doc) => FoodItem.fromMap(doc.id, doc.data()))
+                      .toList()
+                : sampleFoods;
 
             final filteredFoods = filterFoods(foods);
             final picks = filteredFoods.take(6).toList();
@@ -662,7 +774,8 @@ class _HomePageState extends State<HomePage> {
                       const SizedBox(height: 22),
                       TextField(
                         controller: searchController,
-                        onChanged: (value) => setState(() => searchText = value),
+                        onChanged: (value) =>
+                            setState(() => searchText = value),
                         decoration: InputDecoration(
                           hintText: 'Search food...',
                           prefixIcon: const Icon(Icons.search),
@@ -750,12 +863,13 @@ class _HomePageState extends State<HomePage> {
                               itemCount: picks.length,
                               gridDelegate:
                                   SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: columns,
-                                crossAxisSpacing: 13,
-                                mainAxisSpacing: 13,
-                                mainAxisExtent: 290,
-                              ),
-                              itemBuilder: (context, index) => foodCard(picks[index]),
+                                    crossAxisCount: columns,
+                                    crossAxisSpacing: 13,
+                                    mainAxisSpacing: 13,
+                                    mainAxisExtent: 290,
+                                  ),
+                              itemBuilder: (context, index) =>
+                                  foodCard(picks[index]),
                             );
                           },
                         ),
@@ -827,11 +941,7 @@ class _HomePageState extends State<HomePage> {
       return Container(
         color: const Color(0xFFFFE7D6),
         alignment: Alignment.center,
-        child: const Icon(
-          Icons.restaurant,
-          size: 45,
-          color: Color(0xFFE86B35),
-        ),
+        child: const Icon(Icons.restaurant, size: 45, color: Color(0xFFE86B35)),
       );
     }
     if (food.image.startsWith('assets/')) {
@@ -862,11 +972,7 @@ class _HomePageState extends State<HomePage> {
     return Container(
       color: const Color(0xFFFFE7D6),
       alignment: Alignment.center,
-      child: const Icon(
-        Icons.restaurant,
-        color: Color(0xFFE86B35),
-        size: 42,
-      ),
+      child: const Icon(Icons.restaurant, color: Color(0xFFE86B35), size: 42),
     );
   }
 
@@ -882,10 +988,7 @@ class _HomePageState extends State<HomePage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Expanded(
-            child: SizedBox(
-              width: double.infinity,
-              child: foodImage(food),
-            ),
+            child: SizedBox(width: double.infinity, child: foodImage(food)),
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(10, 7, 10, 9),
@@ -1003,7 +1106,10 @@ class _HomePageState extends State<HomePage> {
                       const Expanded(
                         child: Text(
                           'Food Description',
-                          style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+                          style: TextStyle(
+                            fontSize: 19,
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ),
                       IconButton(
@@ -1032,7 +1138,10 @@ class _HomePageState extends State<HomePage> {
                   ),
                   const SizedBox(height: 10),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 7,
+                    ),
                     decoration: BoxDecoration(
                       color: const Color(0xFFFFE7D6),
                       borderRadius: BorderRadius.circular(20),
@@ -1053,12 +1162,20 @@ class _HomePageState extends State<HomePage> {
                   const SizedBox(height: 7),
                   Text(
                     food.description,
-                    style: const TextStyle(fontSize: 14, height: 1.6, color: Colors.black87),
+                    style: const TextStyle(
+                      fontSize: 14,
+                      height: 1.6,
+                      color: Colors.black87,
+                    ),
                   ),
                   const SizedBox(height: 18),
                   Row(
                     children: [
-                      const Icon(Icons.restaurant_menu, color: Color(0xFFE86B35), size: 20),
+                      const Icon(
+                        Icons.restaurant_menu,
+                        color: Color(0xFFE86B35),
+                        size: 20,
+                      ),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
@@ -1131,12 +1248,19 @@ class _HomePageState extends State<HomePage> {
                     children: [
                       Row(
                         children: [
-                          const Icon(Icons.shopping_bag_outlined, color: Color(0xFFE86B35), size: 28),
+                          const Icon(
+                            Icons.shopping_bag_outlined,
+                            color: Color(0xFFE86B35),
+                            size: 28,
+                          ),
                           const SizedBox(width: 10),
                           const Expanded(
                             child: Text(
                               'My Cart',
-                              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                              style: TextStyle(
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold,
+                              ),
                             ),
                           ),
                           IconButton(
@@ -1152,9 +1276,16 @@ class _HomePageState extends State<HomePage> {
                                 child: Column(
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
-                                    Icon(Icons.shopping_cart_outlined, size: 58, color: Colors.black26),
+                                    Icon(
+                                      Icons.shopping_cart_outlined,
+                                      size: 58,
+                                      color: Colors.black26,
+                                    ),
                                     SizedBox(height: 12),
-                                    Text('Your cart is empty.', style: TextStyle(fontSize: 16)),
+                                    Text(
+                                      'Your cart is empty.',
+                                      style: TextStyle(fontSize: 16),
+                                    ),
                                     SizedBox(height: 5),
                                     Text(
                                       'Add your favorite food first!',
@@ -1165,25 +1296,36 @@ class _HomePageState extends State<HomePage> {
                               )
                             : ListView.separated(
                                 itemCount: items.length,
-                                separatorBuilder: (_, __) => const Divider(height: 1),
+                                separatorBuilder: (_, __) =>
+                                    const Divider(height: 1),
                                 itemBuilder: (context, index) {
                                   final food = items[index];
                                   final quantity = cart[food.id] ?? 0;
                                   return ListTile(
-                                    contentPadding: const EdgeInsets.symmetric(vertical: 5),
+                                    contentPadding: const EdgeInsets.symmetric(
+                                      vertical: 5,
+                                    ),
                                     leading: ClipRRect(
                                       borderRadius: BorderRadius.circular(10),
-                                      child: SizedBox(width: 55, height: 55, child: foodImage(food)),
+                                      child: SizedBox(
+                                        width: 55,
+                                        height: 55,
+                                        child: foodImage(food),
+                                      ),
                                     ),
                                     title: Text(
                                       food.name,
                                       maxLines: 2,
                                       overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(fontWeight: FontWeight.bold),
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
                                     ),
                                     subtitle: Text(
                                       '${peso(food.price)} each',
-                                      style: const TextStyle(color: Color(0xFFE86B35)),
+                                      style: const TextStyle(
+                                        color: Color(0xFFE86B35),
+                                      ),
                                     ),
                                     trailing: Row(
                                       mainAxisSize: MainAxisSize.min,
@@ -1195,11 +1337,16 @@ class _HomePageState extends State<HomePage> {
                                             decreaseQuantity(food);
                                             updateSheet(() {});
                                           },
-                                          icon: const Icon(Icons.remove_circle_outline),
+                                          icon: const Icon(
+                                            Icons.remove_circle_outline,
+                                          ),
                                         ),
                                         Text(
                                           '$quantity',
-                                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                                          style: const TextStyle(
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 16,
+                                          ),
                                         ),
                                         IconButton(
                                           tooltip: 'Add one',
@@ -1208,7 +1355,10 @@ class _HomePageState extends State<HomePage> {
                                             increaseQuantity(food);
                                             updateSheet(() {});
                                           },
-                                          icon: const Icon(Icons.add_circle_outline, color: Color(0xFFE86B35)),
+                                          icon: const Icon(
+                                            Icons.add_circle_outline,
+                                            color: Color(0xFFE86B35),
+                                          ),
                                         ),
                                       ],
                                     ),
@@ -1220,7 +1370,13 @@ class _HomePageState extends State<HomePage> {
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text('Total', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                          const Text(
+                            'Total',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
                           Text(
                             peso(total),
                             style: const TextStyle(
@@ -1265,10 +1421,8 @@ class OrderReviewPage extends StatefulWidget {
   final List<FoodItem> items;
   final Map<String, int> quantities;
   final CustomerDetails? initialDetails;
-  final Future<void> Function(
-    CustomerDetails details,
-    VoidCallback closeReview,
-  ) onConfirm;
+  final Future<void> Function(CustomerDetails details, VoidCallback closeReview)
+  onConfirm;
 
   const OrderReviewPage({
     super.key,
@@ -1315,8 +1469,7 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
 
   int qty(FoodItem food) => widget.quantities[food.id] ?? 0;
 
-  int get totalQuantity =>
-      widget.items.fold(0, (sum, food) => sum + qty(food));
+  int get totalQuantity => widget.items.fold(0, (sum, food) => sum + qty(food));
 
   double get total =>
       widget.items.fold(0.0, (sum, food) => sum + food.price * qty(food));
@@ -1363,7 +1516,10 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
               const SizedBox(width: 8),
               Text(
                 title,
-                style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                  fontSize: 17,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ],
           ),
@@ -1395,7 +1551,10 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Text(label, style: bold ? style.copyWith(color: Colors.black87) : style),
+          Text(
+            label,
+            style: bold ? style.copyWith(color: Colors.black87) : style,
+          ),
           Text(value, style: style),
         ],
       ),
@@ -1434,8 +1593,9 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
                                 ...widget.items.map((food) {
                                   final q = qty(food);
                                   return Padding(
-                                    padding:
-                                        const EdgeInsets.symmetric(vertical: 6),
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 6,
+                                    ),
                                     child: Row(
                                       crossAxisAlignment:
                                           CrossAxisAlignment.start,
@@ -1447,8 +1607,9 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
                                           ),
                                           decoration: BoxDecoration(
                                             color: const Color(0xFFFFE7D6),
-                                            borderRadius:
-                                                BorderRadius.circular(8),
+                                            borderRadius: BorderRadius.circular(
+                                              8,
+                                            ),
                                           ),
                                           child: Text(
                                             '${q}x',
@@ -1529,11 +1690,12 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
                                     Icons.phone_outlined,
                                   ),
                                   validator: (value) {
-                                    final text = (value ?? '')
-                                        .replaceAll(RegExp(r'[\s-]'), '');
-                                    final valid =
-                                        RegExp(r'^(09|\+639)\d{9}$')
-                                            .hasMatch(text);
+                                    final text = (value ?? '').replaceAll(
+                                      RegExp(r'[\s-]'),
+                                      '',
+                                    );
+                                    final valid = RegExp(r'^(09|\+639)\d{9}$')
+                                        .hasMatch(text);
                                     if (!valid) {
                                       return 'Maglagay ng valid na PH mobile number.';
                                     }
@@ -1579,7 +1741,10 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
                               'para magbayad (GCash, card, at iba pa). '
                               'Awtomatikong lalabas dito ang kumpirmasyon '
                               'pagkatapos mong magbayad.',
-                              style: TextStyle(color: Colors.black54, height: 1.5),
+                              style: TextStyle(
+                                color: Colors.black54,
+                                height: 1.5,
+                              ),
                             ),
                           ),
                         ],
@@ -1602,8 +1767,9 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
                     children: [
                       Expanded(
                         child: OutlinedButton(
-                          onPressed:
-                              _submitting ? null : () => Navigator.pop(context),
+                          onPressed: _submitting
+                              ? null
+                              : () => Navigator.pop(context),
                           style: OutlinedButton.styleFrom(
                             minimumSize: const Size.fromHeight(48),
                             foregroundColor: orange,
@@ -1646,25 +1812,134 @@ class _OrderReviewPageState extends State<OrderReviewPage> {
   }
 }
 
-class OrderHistoryPage extends StatelessWidget {
-  final String customerUid;
+class OrderHistoryPage extends StatefulWidget {
+  final String historyKey;
+  final ValueChanged<String> onHistoryKeyChanged;
 
-  const OrderHistoryPage({super.key, required this.customerUid});
+  const OrderHistoryPage({
+    super.key,
+    required this.historyKey,
+    required this.onHistoryKeyChanged,
+  });
+
+  @override
+  State<OrderHistoryPage> createState() => _OrderHistoryPageState();
+}
+
+class _OrderHistoryPageState extends State<OrderHistoryPage> {
+  late String _historyKey = widget.historyKey;
 
   String peso(num amount) => '₱${amount.toStringAsFixed(2)}';
+
+  Future<void> _linkDevice() async {
+    final controller = TextEditingController();
+    final key = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('I-link ang desktop at phone'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Ibahagi ang code na ito sa sarili mong device. '
+                'I-paste ito sa kabilang device para makita ang parehong orders.',
+              ),
+              const SizedBox(height: 12),
+              SelectableText(
+                _historyKey,
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              Align(
+                alignment: Alignment.centerRight,
+                child: TextButton.icon(
+                  onPressed: () async {
+                    await Clipboard.setData(ClipboardData(text: _historyKey));
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Nakopya ang private code.')),
+                    );
+                  },
+                  icon: const Icon(Icons.copy),
+                  label: const Text('Kopyahin'),
+                ),
+              ),
+              const Divider(),
+              const Text('May code ka na mula sa kabilang device?'),
+              const SizedBox(height: 8),
+              TextField(
+                controller: controller,
+                decoration: const InputDecoration(
+                  labelText: 'I-paste ang private code',
+                  border: OutlineInputBorder(),
+                ),
+                autocorrect: false,
+                enableSuggestions: false,
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Isara'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, controller.text.trim()),
+            child: const Text('I-link'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+
+    if (key == null || key.isEmpty || !mounted) return;
+    if (!OrderHistoryAccess.isValid(key)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Hindi valid ang private code.')),
+      );
+      return;
+    }
+
+    try {
+      await OrderHistoryAccess.ensureMembership(key);
+      await OrderHistoryAccess.save(key);
+      if (!mounted) return;
+      setState(() => _historyKey = key);
+      widget.onHistoryKeyChanged(key);
+    } catch (error) {
+      debugPrint('Unable to link order history: $error');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Hindi ma-link ang device: $error')),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFFFFBF5),
       appBar: AppBar(
-        title: const Text('Order History', style: TextStyle(fontWeight: FontWeight.bold)),
+        title: const Text(
+          'Order History',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
         backgroundColor: const Color(0xFFFFFBF5),
+        actions: [
+          IconButton(
+            tooltip: 'I-link ang desktop at phone',
+            onPressed: _linkDevice,
+            icon: const Icon(Icons.devices),
+          ),
+        ],
       ),
       body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
         stream: FirebaseFirestore.instance
             .collection('orders')
-            .where('customerUid', isEqualTo: customerUid)
+            .where('historyKey', isEqualTo: _historyKey)
             .snapshots(),
         builder: (context, snapshot) {
           if (snapshot.hasError) {
@@ -1688,8 +1963,9 @@ class OrderHistoryPage extends StatelessWidget {
           orders.sort((a, b) {
             final aDate = a.data()['createdAt'] as Timestamp?;
             final bDate = b.data()['createdAt'] as Timestamp?;
-            return (bDate?.millisecondsSinceEpoch ?? 0)
-                .compareTo(aDate?.millisecondsSinceEpoch ?? 0);
+            return (bDate?.millisecondsSinceEpoch ?? 0).compareTo(
+              aDate?.millisecondsSinceEpoch ?? 0,
+            );
           });
 
           if (orders.isEmpty) {
@@ -1699,9 +1975,19 @@ class OrderHistoryPage extends StatelessWidget {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.receipt_long_outlined, size: 64, color: Colors.black26),
+                    Icon(
+                      Icons.receipt_long_outlined,
+                      size: 64,
+                      color: Colors.black26,
+                    ),
                     SizedBox(height: 12),
-                    Text('No orders yet.', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    Text(
+                      'No orders yet.',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                     SizedBox(height: 6),
                     Text('Your orders will appear here.'),
                   ],
@@ -1735,24 +2021,37 @@ class OrderHistoryPage extends StatelessWidget {
                     children: [
                       Row(
                         children: [
-                          const Icon(Icons.shopping_bag_outlined, color: Color(0xFFE86B35)),
+                          const Icon(
+                            Icons.shopping_bag_outlined,
+                            color: Color(0xFFE86B35),
+                          ),
                           const SizedBox(width: 8),
                           Expanded(
                             child: SelectableText(
                               'Order ID: ${orders[index].id}',
-                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
                             ),
                           ),
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 6,
+                            ),
                             decoration: BoxDecoration(
-                              color: status == 'PAID' ? Colors.green.shade100 : const Color(0xFFFFE7D6),
+                              color: status == 'PAID'
+                                  ? Colors.green.shade100
+                                  : const Color(0xFFFFE7D6),
                               borderRadius: BorderRadius.circular(20),
                             ),
                             child: Text(
                               status,
                               style: TextStyle(
-                                color: status == 'PAID' ? Colors.green.shade800 : const Color(0xFFB84C20),
+                                color: status == 'PAID'
+                                    ? Colors.green.shade800
+                                    : const Color(0xFFB84C20),
                                 fontSize: 11,
                                 fontWeight: FontWeight.bold,
                               ),
@@ -1762,31 +2061,49 @@ class OrderHistoryPage extends StatelessWidget {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        date == null ? 'Date: Saving...' : 'Date: ${date.toLocal().toString().substring(0, 16)}',
-                        style: const TextStyle(color: Colors.black54, fontSize: 12),
+                        date == null
+                            ? 'Date: Saving...'
+                            : 'Date: ${date.toLocal().toString().substring(0, 16)}',
+                        style: const TextStyle(
+                          color: Colors.black54,
+                          fontSize: 12,
+                        ),
                       ),
                       if (data['customer'] is Map) ...[
                         const SizedBox(height: 6),
                         Text(
-                          '${(data['customer'] as Map)['name'] ?? ''} • ${(data['customer'] as Map)['phone'] ?? ''}',
-                          style: const TextStyle(fontSize: 12, color: Colors.black87),
+                          '${(data['customer'] as Map)['name'] ?? ''} • ${(
+                            data['customer'] as Map
+                          )['phone'] ?? ''}',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.black87,
+                          ),
                         ),
                         Text(
                           '${(data['customer'] as Map)['address'] ?? ''}',
-                          style: const TextStyle(fontSize: 12, color: Colors.black54),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.black54,
+                          ),
                         ),
                       ],
                       const Divider(height: 24),
                       ...items.map((item) {
                         final food = Map<String, dynamic>.from(item as Map);
                         final name = food['name']?.toString() ?? 'Food item';
-                        final quantity = (food['quantity'] as num?)?.toInt() ?? 0;
+                        final quantity =
+                            (food['quantity'] as num?)?.toInt() ?? 0;
                         final price = (food['price'] as num?) ?? 0;
                         return Padding(
                           padding: const EdgeInsets.only(bottom: 8),
                           child: Row(
                             children: [
-                              Expanded(child: Text('$name × $quantity (${peso(price)} each)')),
+                              Expanded(
+                                child: Text(
+                                  '$name × $quantity (${peso(price)} each)',
+                                ),
+                              ),
                               Text(peso(price * quantity)),
                             ],
                           ),
@@ -1796,7 +2113,13 @@ class OrderHistoryPage extends StatelessWidget {
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text('Total', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                          const Text(
+                            'Total',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
                           Text(
                             peso(total),
                             style: const TextStyle(
@@ -1851,8 +2174,18 @@ class _PaymentStatusDialogState extends State<PaymentStatusDialog> {
 
   String formatDate(DateTime date) {
     const months = [
-      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
     ];
     final d = date.toLocal();
     final hour = d.hour.toString().padLeft(2, '0');
@@ -1866,9 +2199,10 @@ class _PaymentStatusDialogState extends State<PaymentStatusDialog> {
     if (text.length <= 5) return text.toUpperCase(); // GCASH, CARD
     return text
         .split(' ')
-        .map((w) => w.isEmpty
-            ? w
-            : w[0].toUpperCase() + w.substring(1).toLowerCase())
+        .map(
+          (w) =>
+              w.isEmpty ? w : w[0].toUpperCase() + w.substring(1).toLowerCase(),
+        )
         .join(' ');
   }
 
@@ -1893,30 +2227,30 @@ class _PaymentStatusDialogState extends State<PaymentStatusDialog> {
         .doc(widget.orderId)
         .snapshots()
         .listen(
-      (snapshot) {
-        final data = snapshot.data();
-        if (data == null || !mounted) return;
-        final status = data['paymentStatus']?.toString() ?? 'PENDING';
-        final channel = data['paymentChannel']?.toString() ?? '';
-        final method = data['paymentMethod']?.toString() ?? '';
+          (snapshot) {
+            final data = snapshot.data();
+            if (data == null || !mounted) return;
+            final status = data['paymentStatus']?.toString() ?? 'PENDING';
+            final channel = data['paymentChannel']?.toString() ?? '';
+            final method = data['paymentMethod']?.toString() ?? '';
 
-        setState(() {
-          _status = status;
-          _total = (data['totalAmount'] as num?) ?? 0;
-          _paymentMethod = channel.isNotEmpty ? channel : method;
-          _paidAt = parseDate(data['paidAt']) ?? _paidAt;
-          _hasError = false;
-        });
-        if (status == 'PAID' && !_paidHandled) {
-          _paidHandled = true;
-          _paidAt ??= DateTime.now();
-          widget.onPaid();
-        }
-      },
-      onError: (Object error) {
-        if (mounted) setState(() => _hasError = true);
-      },
-    );
+            setState(() {
+              _status = status;
+              _total = (data['totalAmount'] as num?) ?? 0;
+              _paymentMethod = channel.isNotEmpty ? channel : method;
+              _paidAt = parseDate(data['paidAt']) ?? _paidAt;
+              _hasError = false;
+            });
+            if (status == 'PAID' && !_paidHandled) {
+              _paidHandled = true;
+              _paidAt ??= DateTime.now();
+              widget.onPaid();
+            }
+          },
+          onError: (Object error) {
+            if (mounted) setState(() => _hasError = true);
+          },
+        );
   }
 
   @override
@@ -2002,7 +2336,10 @@ class _PaymentStatusDialogState extends State<PaymentStatusDialog> {
             children: [
               Text(
                 peso(_total),
-                style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
+                style: const TextStyle(
+                  fontSize: 19,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
               const SizedBox(height: 6),
               Row(
@@ -2040,7 +2377,10 @@ class _PaymentStatusDialogState extends State<PaymentStatusDialog> {
             children: [
               Text(
                 formatDate(_paidAt ?? DateTime.now()),
-                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
+                ),
               ),
             ],
           ),
@@ -2068,7 +2408,8 @@ class _PaymentStatusDialogState extends State<PaymentStatusDialog> {
       icon = Icons.timer_off_outlined;
       iconColor = Colors.black45;
       title = 'Payment expired';
-      message = 'Nag-expire na ang invoice. Mag-checkout ulit para makapag-order.';
+      message =
+          'Nag-expire na ang invoice. Mag-checkout ulit para makapag-order.';
     } else if (_hasError) {
       icon = Icons.error_outline;
       title = 'Hindi ma-check ang payment';
@@ -2103,7 +2444,10 @@ class _PaymentStatusDialogState extends State<PaymentStatusDialog> {
               Text(
                 title,
                 textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
+                style: const TextStyle(
+                  fontSize: 22,
+                  fontWeight: FontWeight.w800,
+                ),
               ),
               if (message.isNotEmpty) ...[
                 const SizedBox(height: 8),
@@ -2113,10 +2457,7 @@ class _PaymentStatusDialogState extends State<PaymentStatusDialog> {
                   style: const TextStyle(color: Colors.black54),
                 ),
               ],
-              if (paid) ...[
-                const SizedBox(height: 20),
-                receiptCard(),
-              ],
+              if (paid) ...[const SizedBox(height: 20), receiptCard()],
             ],
           ),
         ),

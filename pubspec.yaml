@@ -20,6 +20,7 @@ dependencies:
   # Para sa Supabase Edge Function at Xendit checkout
   http: ^1.2.2
   url_launcher: ^6.3.1
+  shared_preferences: ^2.5.6
 
 dev_dependencies:
   flutter_test:

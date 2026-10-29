@@ -1,0 +1,61 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAdmin() {
+      return request.auth != null
+             && request.auth.uid == 'RjyDooTkieWR2J9RFIY0A2yhdnm2';
+    }
+
+    match /products/{productId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /historyGroups/{historyKey}/members/{memberUid} {
+      allow get: if request.auth != null
+                 && request.auth.uid == memberUid;
+
+      allow create: if request.auth != null
+                    && request.auth.uid == memberUid
+                    && historyKey.matches('^[A-Za-z0-9_-]{43}$')
+                    && request.resource.data.keys().hasOnly(['joinedAt'])
+                    && request.resource.data.joinedAt == request.time;
+
+      allow update, delete: if false;
+    }
+
+    match /orders/{orderId} {
+      allow read: if isAdmin()
+                  || (
+                    request.auth != null
+                    && resource.data.keys().hasAll(['historyKey'])
+                    && resource.data.historyKey is string
+                    && exists(
+                      /databases/$(database)/documents/historyGroups/$(resource.data.historyKey)/members/$(request.auth.uid)
+                    )
+                  );
+
+      allow create: if request.auth != null
+                    && request.resource.data.customerUid == request.auth.uid
+                    && request.resource.data.historyKey is string
+                    && request.resource.data.historyKey.matches('^[A-Za-z0-9_-]{43}$')
+                    && exists(
+                      /databases/$(database)/documents/historyGroups/$(request.resource.data.historyKey)/members/$(request.auth.uid)
+                    )
+                    && request.resource.data.paymentStatus == 'PENDING'
+                    && request.resource.data.createdAt == request.time
+                    && request.resource.data.keys().hasOnly([
+                      'customerUid',
+                      'historyKey',
+                      'items',
+                      'totalAmount',
+                      'customer',
+                      'notes',
+                      'paymentStatus',
+                      'createdAt'
+                    ]);
+
+      allow update, delete: if false;
+    }
+  }
+}
